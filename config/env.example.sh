@@ -12,8 +12,8 @@ WEBHOOK_LAMBDA_NAME="hap-stripe-webhook"
 AGENT_LAMBDA_NAME="hap-agents-api"
 
 # CloudFront distributions for this environment
-TRAVEL_CF_ID="E1EXAMPLETRAVEL"
-AGENT_CF_ID="E2EXAMPLEAGENT"
+TRAVEL_CF_ID="E1E....L"
+AGENT_CF_ID="E2...."
 
 # hap-travel-api Lambda
 AGENT_SHARED_SECRET=replace_me

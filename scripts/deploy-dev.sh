@@ -1,27 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Disable AWS CLI pager so script doesn't get stuck
 export AWS_PAGER=""
 
 # Resolve repo root regardless of where we run from
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 ########################################
-# 1. Config – EDIT THESE FOR YOUR ENV  #
+# 1. Load environment config           #
 ########################################
 
-# S3 buckets
-TRAVEL_BUCKET="travel.sanatdhir.com"
-AGENT_BUCKET="agent.sanatdhir.com"
+ENVIRONMENT=${1:-dev}  # default env is "dev"
+ENV_FILE="$ROOT_DIR/config/env.${ENVIRONMENT}.sh"
 
-# Lambda function names (exactly as in AWS)
-TRAVEL_LAMBDA_NAME="hap-travel-api"
-WEBHOOK_LAMBDA_NAME="hap-stripe-webhook"
-AGENT_LAMBDA_NAME="hap-agents-api"
+if [ ! -f "$ENV_FILE" ]; then
+  echo "❌ Env file not found: $ENV_FILE"
+  echo "   Create it from: config/env.example.sh"
+  exit 1
+fi
 
-# CloudFront Distribution IDs (from AWS console)
-TRAVEL_CF_ID="E1G1..."  # travel.sanatdhir.com distribution ID
-AGENT_CF_ID="EH..."   # agent.sanatdhir.com distribution ID
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+# Optionally set AWS_REGION/AWS_PROFILE for aws CLI
+if [ -n "${AWS_REGION:-}" ]; then
+  export AWS_REGION
+fi
+if [ -n "${AWS_PROFILE:-}" ]; then
+  export AWS_PROFILE
+fi
+
+echo "🚀 Deploying environment: $ENVIRONMENT"
+echo "   AWS_PROFILE=${AWS_PROFILE:-default}, AWS_REGION=${AWS_REGION:-default}"
 
 ########################################
 # 2. Build and deploy Lambdas          #
