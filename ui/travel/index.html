@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Travel Search – Human UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem; }
+    h1 { margin-bottom: 0.5rem; }
+    label { display: block; margin-top: 0.75rem; }
+    input { padding: 0.4rem; margin-top: 0.25rem; width: 220px; max-width: 100%; }
+    button { margin-top: 1rem; padding: 0.5rem 1rem; cursor: pointer; }
+    .card { max-width: 520px; padding: 1rem 1.25rem; border: 1px solid #ddd; border-radius: 8px; }
+    .note { font-size: 0.9rem; color: #555; margin-top: 1rem; }
+    pre { background: #f5f5f5; padding: 0.75rem; border-radius: 6px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Travel Search (Human)</h1>
+    <p>This is the human-facing UI calling our HAP-aware Travel API.</p>
+
+    <label>
+      From (airport code)
+      <input id="from" placeholder="SFO" />
+    </label>
+
+    <label>
+      To (airport code)
+      <input id="to" placeholder="JFK" />
+    </label>
+
+    <label>
+      Date
+      <input id="date" type="date" />
+    </label>
+
+    <button onclick="searchFlights()">Search flights</button>
+
+    <p class="note" id="note">
+      Fill in the form and click search. The browser will call
+      <code>https://api.sanatdhir.com/api/flights/search</code> with a PAT-like header
+      (<code>Sec-Token: demo-pat-valid</code>) so the backend knows this is human traffic.
+    </p>
+
+    <h3>Results</h3>
+    <pre id="results">(none yet)</pre>
+  </div>
+
+  <script>
+    async function searchFlights() {
+      const from = (document.getElementById('from').value || 'SFO').toUpperCase();
+      const to = (document.getElementById('to').value || 'JFK').toUpperCase();
+      const date = document.getElementById('date').value || new Date().toISOString().slice(0, 10);
+
+      document.getElementById('note').textContent = 'Calling the HAP Travel API as a human...';
+      document.getElementById('results').textContent = '(loading...)';
+
+      try {
+        const url = `https://api.sanatdhir.com/api/flights/search?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&date=${encodeURIComponent(date)}`;
+
+        const res = await fetch(url.toString(), {
+            headers: {
+                // Simulated Private Access Token so the API treats this as a human request.
+                // We can't use "Sec-*" from JS (browser forbids it), so we use X-Human-Token instead.
+                'X-Human-Token': 'demo-pat-valid'
+            }
+        });
+
+        const text = await res.text();
+
+        document.getElementById('note').textContent =
+          `Status ${res.status} – classified as human if Sec-Token is accepted.`;
+        document.getElementById('results').textContent = text;
+      } catch (err) {
+        document.getElementById('note').textContent = 'Error calling API: ' + err;
+        document.getElementById('results').textContent = '';
+      }
+    }
+  </script>
+</body>
+</html>
