@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export AWS_PAGER=""
+
 # Resolve repo root regardless of where we run from
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -15,10 +17,11 @@ AGENT_BUCKET="agent.sanatdhir.com"
 # Lambda function names (exactly as in AWS)
 TRAVEL_LAMBDA_NAME="hap-travel-api"
 WEBHOOK_LAMBDA_NAME="hap-stripe-webhook"
+AGENT_LAMBDA_NAME="hap-agents-api"
 
 # CloudFront Distribution IDs (from AWS console)
-TRAVEL_CF_ID="E1XXXXXXXXXXXXX"  # travel.sanatdhir.com distribution ID
-AGENT_CF_ID="E2YYYYYYYYYYYYY"   # agent.sanatdhir.com distribution ID
+TRAVEL_CF_ID="E1G1WOJMP3K5UL"  # travel.sanatdhir.com distribution ID
+AGENT_CF_ID="EHJVHXRVQ5BHQ"   # agent.sanatdhir.com distribution ID
 
 ########################################
 # 2. Build and deploy Lambdas          #
@@ -38,6 +41,14 @@ pushd "$ROOT_DIR/lambda/hap-stripe-webhook" > /dev/null
 aws lambda update-function-code \
   --function-name "$WEBHOOK_LAMBDA_NAME" \
   --zip-file fileb://hap-stripe-webhook.zip
+popd > /dev/null
+
+echo "=== Building and deploying $AGENT_LAMBDA_NAME ==="
+pushd "$ROOT_DIR/lambda/hap-agents-api" > /dev/null
+./build.sh
+aws lambda update-function-code \
+  --function-name "$AGENT_LAMBDA_NAME" \
+  --zip-file fileb://hap-agents-api.zip
 popd > /dev/null
 
 ########################################
