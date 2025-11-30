@@ -133,6 +133,8 @@ sessions_table = dynamodb.Table(PAYMENT_SESSIONS_TABLE)
 agents_table = dynamodb.Table(AGENTS_TABLE_NAME)
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+# Default autopay amount if not overridden per agent (in cents)
+AUTOPAY_DEFAULT_AMOUNT_CENTS = 100  # $1.00 for DEFAULT_AGENT_TOPUP_CREDITS
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
 STRIPE_SUCCESS_URL = os.environ.get("STRIPE_SUCCESS_URL", "")
 STRIPE_CANCEL_URL = os.environ.get("STRIPE_CANCEL_URL", "")
@@ -375,6 +377,103 @@ def create_checkout_session(agent_id: str, credits: int = DEFAULT_AGENT_TOPUP_CR
 
     return session.id, session.url
 
+def maybe_autopay_topup(agent_id: str, current_credits: int):
+    """
+    Try to automatically top up this agent's wallet if autopay is enabled.
+
+    Returns:
+      (topped_up: bool, new_credits: int, error: str | None)
+    """
+    # Look up agent config (autopay flags, Stripe IDs, etc.)
+    try:
+        resp = agents_table.get_item(Key={"agentId": agent_id})
+        agent = resp.get("Item")
+    except Exception as e:
+        log("autopay_agent_lookup_error", agentId=agent_id, error=str(e))
+        return False, current_credits, "agent_lookup_failed"
+
+    if not agent:
+        log("autopay_disabled_no_agent", agentId=agent_id)
+        return False, current_credits, "no_agent_record"
+
+    # Is autopay enabled?
+    enabled = agent.get("autopayEnabled")
+    if isinstance(enabled, str):
+        enabled = enabled.lower() in ("1", "true", "yes", "y")
+    if not enabled:
+        return False, current_credits, "autopay_not_enabled"
+
+    customer_id = agent.get("stripeCustomerId")
+    if not customer_id:
+        log("autopay_missing_stripe_customer", agentId=agent_id)
+        return False, current_credits, "missing_stripe_customer"
+
+    topup_credits = int(agent.get("autopayTopupCredits", DEFAULT_AGENT_TOPUP_CREDITS))
+    amount_cents = int(agent.get("autopayAmountCents", AUTOPAY_DEFAULT_AMOUNT_CENTS))
+    currency = agent.get("autopayCurrency", "usd")
+
+    # Create a PaymentIntent using the customer's default card, off-session
+    try:
+        intent = stripe.PaymentIntent.create(
+            amount=amount_cents,
+            currency=currency,
+            customer=customer_id,
+            payment_method_types=["card"],
+            off_session=True,
+            confirm=True,
+            metadata={
+                "agent_id": agent_id,
+                "autopay": "true",
+                "credits": str(topup_credits),
+            },
+        )
+    except Exception as e:
+        log("autopay_paymentintent_error", agentId=agent_id, error=str(e))
+        return False, current_credits, "stripe_error"
+
+    if intent.status != "succeeded":
+        log(
+            "autopay_payment_not_succeeded",
+            agentId=agent_id,
+            status=intent.status,
+            intentId=intent.id,
+        )
+        return False, current_credits, f"payment_status_{intent.status}"
+
+    # Record the autopay event in HAP_PAYMENT_SESSIONS
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        sessions_table.put_item(
+            Item={
+                "sessionId": intent.id,
+                "agentId": agent_id,
+                "createdAt": now,
+                "paidAt": now,
+                "creditsPurchased": decimal.Decimal(topup_credits),
+                "status": "succeeded",
+                "mode": "autopay",
+                "paymentIntentId": intent.id,
+            }
+        )
+        log(
+            "autopay_session_recorded",
+            sessionId=intent.id,
+            agentId=agent_id,
+            credits=topup_credits,
+        )
+    except Exception as e:
+        log("autopay_sessions_put_error", agentId=agent_id, error=str(e))
+
+    # Actually top up the wallet
+    new_credits = change_wallet_credits(agent_id, topup_credits)
+    log(
+        "autopay_wallet_topped_up",
+        agentId=agent_id,
+        added=topup_credits,
+        credits=new_credits,
+    )
+
+    return True, new_credits, None
 
 # ---------- Handlers ----------
 
@@ -549,23 +648,32 @@ def handle_flights_search(event):
         wallet = ensure_wallet(agent_id)
         current_credits = int(wallet.get("credits", 0))
 
+        wallet = ensure_wallet(agent_id)
+        current_credits = int(wallet.get("credits", 0))
+
         if current_credits <= 0:
-            # No credits – return 402 with checkout URL
-            session_id, checkout_url = create_checkout_session(agent_id)
-            increment_stat("agent")  # still counts as agent traffic
-            return build_response(
-                402,
-                {
+            # Try autopay first, if enabled for this agent
+            topped_up, current_credits, autopay_error = maybe_autopay_topup(agent_id, current_credits)
+
+            if not topped_up and current_credits <= 0:
+                # Still no credits – fall back to manual 402 + Checkout
+                session_id, checkout_url = create_checkout_session(agent_id)
+                increment_stat("agent")  # still counts as agent traffic
+
+                body = {
                     "status": "payment_required",
                     "kind": "agent",
                     "message": "Agent has no credits; complete payment to continue.",
                     "checkoutUrl": checkout_url,
                     "checkoutSessionId": session_id,
                     "creditsPerPurchase": DEFAULT_AGENT_TOPUP_CREDITS,
-                },
-            )
+                }
+                if autopay_error:
+                    body["autopayError"] = autopay_error
 
-        # Deduct one credit and return flights
+                return build_response(402, body)
+
+        # At this point, we have > 0 credits (either existing or after autopay).
         remaining = change_wallet_credits(agent_id, -1)
         increment_stat("agent")
 
