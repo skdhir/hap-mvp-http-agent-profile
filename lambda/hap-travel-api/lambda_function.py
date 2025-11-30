@@ -5,9 +5,13 @@ import datetime
 import decimal
 import hmac
 import hashlib
+import base64
 
 import boto3
 import stripe
+
+import boto3
+from ecdsa import VerifyingKey, NIST256p, BadSignatureError
 
 # ---------- Logging setup ----------
 
@@ -36,6 +40,42 @@ def log(event_name: str, **fields):
 
 
 # ---------- Helpers ----------
+
+def b64url_decode(s: str) -> bytes:
+    padding = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + padding)
+
+
+def load_verifying_key_from_jwk(jwk: dict) -> VerifyingKey:
+    """
+    Convert a P-256 EC JWK to an ecdsa.VerifyingKey.
+    Expects:
+      {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "<b64url>",
+        "y": "<b64url>",
+        ...
+      }
+    """
+    if jwk.get("kty") != "EC" or jwk.get("crv") != "P-256":
+        raise ValueError("Unsupported key type for agent public key")
+
+    x_bytes = b64url_decode(jwk["x"])
+    y_bytes = b64url_decode(jwk["y"])
+
+    # ecdsa library wants raw uncompressed point: x || y (64 bytes)
+    return VerifyingKey.from_string(x_bytes + y_bytes, curve=NIST256p)
+
+
+def build_signing_string(method: str, path_with_query: str, body_bytes: bytes, timestamp: str) -> str:
+    """
+    EXACTLY matches what you're doing in Colab:
+
+        <METHOD>\n<PATH_WITH_QUERY>\n<TIMESTAMP>\n<SHA256_HEX(body)>
+    """
+    body_hash = hashlib.sha256(body_bytes or b"").hexdigest()
+    return f"{method.upper()}\n{path_with_query}\n{timestamp}\n{body_hash}"
 
 def decimal_default(obj):
     if isinstance(obj, decimal.Decimal):
@@ -76,10 +116,12 @@ dynamodb = boto3.resource("dynamodb")
 HAP_STATS_TABLE = os.environ.get("HAP_STATS_TABLE", "hap_stats")
 AGENT_WALLETS_TABLE = os.environ.get("AGENT_WALLETS_TABLE", "HAP_AGENT_WALLETS")
 PAYMENT_SESSIONS_TABLE = os.environ.get("PAYMENT_SESSIONS_TABLE", "HAP_PAYMENT_SESSIONS")
+AGENTS_TABLE_NAME = os.environ.get("HAP_AGENTS_TABLE", "HAP_AGENTS")
 
 stats_table = dynamodb.Table(HAP_STATS_TABLE)
 wallets_table = dynamodb.Table(AGENT_WALLETS_TABLE)
 sessions_table = dynamodb.Table(PAYMENT_SESSIONS_TABLE)
+agents_table = dynamodb.Table(AGENTS_TABLE_NAME)
 
 AGENT_SHARED_SECRET = os.environ.get("AGENT_SHARED_SECRET", "")
 
@@ -179,7 +221,7 @@ def build_canonical_string(event, sig_agent: str) -> str:
     return "\n".join([method, raw_path, raw_qs, sig_agent or ""])
 
 
-def verify_agent_request(event):
+def verify_agent_request_old_donotuse(event):
     headers = get_header_map(event)
     client_class = headers.get("sec-client-class", "").lower()
     sig_agent = headers.get("signature-agent")
@@ -195,16 +237,35 @@ def verify_agent_request(event):
         )
 
     auth = headers.get("authorization", "")
-    prefix = "hap-sig "
-    if not auth.lower().startswith(prefix):
-        return False, None, build_response(
-            401,
-            {
+
+    headers = event.get("headers") or {}
+    headers_lower = {k.lower(): v for k, v in headers.items()}
+
+    ok, result = verify_agent_signature(event, headers_lower)
+    if not ok:
+        # result is an error message string
+        return {
+            "statusCode": 401,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
                 "status": "unauthorized",
                 "kind": "agent",
-                "message": "Missing HAP-Sig Authorization header.",
-            },
-        )
+                "message": result,
+            }),
+        }
+
+    agent_id = result  # this is the verified agentId
+    
+    # prefix = "hap-sig "
+    # if not auth.lower().startswith(prefix):
+    #     return False, None, build_response(
+    #         401,
+    #         {
+    #             "status": "unauthorized",
+    #             "kind": "agent",
+    #             "message": "Missing HAP-Sig Authorization header.",
+    #         },
+    #     )
 
     if not AGENT_SHARED_SECRET:
         log("agent_auth_misconfig", reason="AGENT_SHARED_SECRET env not set")
@@ -245,6 +306,45 @@ def verify_agent_request(event):
     agent_id = sig_agent or "unknown-agent"
     return True, agent_id, None
 
+def verify_agent_request(event):
+    """
+    Verify that this is a properly signed agent request using ECDSA.
+
+    Returns:
+      (verified: bool, agent_id: str | None, error_response: dict | None)
+    """
+    headers = get_header_map(event)
+    client_class = headers.get("sec-client-class", "").lower()
+
+    # 1) Must clearly declare itself as an agent
+    if client_class != "agent":
+        return False, None, build_response(
+            401,
+            {
+                "status": "unauthorized",
+                "kind": "agent",
+                "message": "Missing or invalid Sec-Client-Class: agent.",
+            },
+        )
+
+    # 2) Verify the ECDSA signature using headers + event
+    headers_lower = headers  # already lower‑cased by get_header_map
+    ok, result = verify_agent_signature(event, headers_lower)
+
+    if not ok:
+        # result is an error message string like "Unknown agentId" or "Invalid agent signature"
+        return False, None, build_response(
+            401,
+            {
+                "status": "unauthorized",
+                "kind": "agent",
+                "message": result,
+            },
+        )
+
+    # 3) Success – result is the verified agentId
+    agent_id = result
+    return True, agent_id, None
 
 def create_checkout_session(agent_id: str, credits: int = DEFAULT_AGENT_TOPUP_CREDITS):
     """
@@ -469,9 +569,9 @@ def fake_flight_results(from_airport: str, to_airport: str, date: str):
 def handle_flights_search(event):
     headers = get_header_map(event)
     qs = event.get("queryStringParameters") or {}
-    from_airport = qs.get("from")
-    to_airport = qs.get("to")
-    date = qs.get("date")
+    from_airport = qs.get("from") or qs.get("origin")
+    to_airport   = qs.get("to")   or qs.get("destination")
+    date         = qs.get("date")
 
     log(
         "flights_request",
@@ -513,7 +613,7 @@ def handle_flights_search(event):
 
         body = {
             "kind": "agent",
-            "auth": "HAP-Sig (demo HMAC)",
+            "auth": "HAP ECDSA (v0)",
             "signatureAgent": agent_id,
             "creditsRemaining": remaining,
             "from": from_airport,
@@ -590,3 +690,64 @@ def lambda_handler(event, context):
             error=str(e),
         )
         return build_response(500, {"message": "Internal Server Error"})
+
+def verify_agent_signature(event, headers_lower):
+    """
+    Verify the ECDSA signature from your agent.
+    Returns:
+      (ok: bool, value: str)
+        if ok is True: value = agentId
+        if ok is False: value = error message
+    """
+    agent_id = headers_lower.get("hap-agent-id")
+    hap_sig = headers_lower.get("hap-signature")
+    ts = headers_lower.get("x-hap-timestamp")
+
+    if not (agent_id and hap_sig and ts):
+        return False, "Missing HAP agent signature headers"
+
+    if not hap_sig.startswith("v0:"):
+        return False, "Unsupported HAP-Signature version"
+
+    sig_b64 = hap_sig.split(":", 1)[1]
+    try:
+        sig_bytes = b64url_decode(sig_b64)
+    except Exception:
+        return False, "Malformed signature encoding"
+
+    # Reconstruct the same path_with_query that Colab signed
+    method = event["requestContext"]["http"]["method"]
+    raw_path = event.get("rawPath") or event["requestContext"]["http"]["path"]
+    raw_query = event.get("rawQueryString") or ""
+    if raw_query:
+        path_with_query = f"{raw_path}?{raw_query}"
+    else:
+        path_with_query = raw_path
+
+    body_str = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        body_bytes = base64.b64decode(body_str)
+    else:
+        body_bytes = body_str.encode("utf-8")
+
+    signing_string = build_signing_string(method, path_with_query, body_bytes, ts)
+
+    # Look up the agent's public key in HAP_AGENTS
+    resp = agents_table.get_item(Key={"agentId": agent_id})
+    item = resp.get("Item")
+    if not item:
+        return False, "Unknown agentId"
+
+    jwk = item.get("publicKeyJwk")
+    if isinstance(jwk, str):
+        jwk = json.loads(jwk)
+
+    try:
+        vk = load_verifying_key_from_jwk(jwk)
+        vk.verify(sig_bytes, signing_string.encode("utf-8"))
+    except BadSignatureError:
+        return False, "Invalid agent signature"
+    except Exception as e:
+        return False, f"Error verifying signature: {str(e)}"
+
+    return True, agent_id

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>HAP Agent Key Issuer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 2rem;
+      max-width: 800px;
+    }
+    h1 {
+      margin-bottom: 0.5rem;
+    }
+    button {
+      padding: 0.5rem 1rem;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+    #status {
+      margin-top: 1rem;
+      font-weight: 500;
+    }
+    #output {
+      width: 100%;
+      margin-top: 0.5rem;
+      font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+    }
+    .warning {
+      margin-top: 1rem;
+      color: #b00020;
+      font-weight: 600;
+    }
+    .back-link {
+      margin-top: 2rem;
+      display: inline-block;
+    }
+  </style>
+</head>
+<body>
+  <h1>Agent Key Issuer</h1>
+  <p>
+    Click the button below to create a new agent with its own public/private key pair.
+  </p>
+
+  <button id="create-agent-btn">Create new agent</button>
+
+  <p id="status"></p>
+
+  <textarea id="output" rows="16" cols="80" readonly></textarea>
+
+  <p class="warning">
+    Important: Copy and securely store the <code>privateKeyBase64</code>.  
+    It is returned only once and is <strong>not</strong> stored on the server.
+  </p>
+
+  <a class="back-link" href="./dashboard.html">&larr; Back to dashboard</a>
+
+  <script src="./agents.js"></script>
+</body>
+</html>

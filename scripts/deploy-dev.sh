@@ -31,59 +31,115 @@ if [ -n "${AWS_PROFILE:-}" ]; then
   export AWS_PROFILE
 fi
 
-echo "🚀 Deploying environment: $ENVIRONMENT"
+# Track which step we're on so errors are easier to see
+STEP="initialization"
+trap 'echo ""; echo "❌ Deployment failed during: $STEP"; echo ""; exit 1' ERR
+
+echo "🚀 Deploying HAP Travel – environment: $ENVIRONMENT"
 echo "   AWS_PROFILE=${AWS_PROFILE:-default}, AWS_REGION=${AWS_REGION:-default}"
+echo ""
+echo "   TRAVEL_BUCKET     = $TRAVEL_BUCKET"
+echo "   AGENT_BUCKET      = $AGENT_BUCKET"
+echo "   TRAVEL_LAMBDA     = $TRAVEL_LAMBDA_NAME"
+echo "   WEBHOOK_LAMBDA    = $WEBHOOK_LAMBDA_NAME"
+echo "   AGENT_LAMBDA      = $AGENT_LAMBDA_NAME"
+echo "   TRAVEL_CF_ID      = $TRAVEL_CF_ID"
+echo "   AGENT_CF_ID       = $AGENT_CF_ID"
+echo ""
 
 ########################################
 # 2. Build and deploy Lambdas          #
 ########################################
 
-echo "=== Building and deploying $TRAVEL_LAMBDA_NAME ==="
+# --- hap-travel-api ---
+
+STEP="build $TRAVEL_LAMBDA_NAME"
+echo "🚀 === $STEP ==="
 pushd "$ROOT_DIR/lambda/hap-travel-api" > /dev/null
-./build.sh
+# Hide noisy build stdout, but keep errors on stderr visible
+./build.sh > /dev/null
+popd > /dev/null
+echo "   ✅ Build complete"
+
+STEP="deploy $TRAVEL_LAMBDA_NAME"
+echo "🚀 === $STEP ==="
 aws lambda update-function-code \
   --function-name "$TRAVEL_LAMBDA_NAME" \
-  --zip-file fileb://hap-travel-api.zip
-popd > /dev/null
+  --zip-file fileb://"$ROOT_DIR/lambda/hap-travel-api/hap-travel-api.zip" \
+  > /dev/null
+echo "   ✅ Lambda code updated"
+echo ""
 
-echo "=== Building and deploying $WEBHOOK_LAMBDA_NAME ==="
+# --- hap-stripe-webhook ---
+
+STEP="build $WEBHOOK_LAMBDA_NAME"
+echo "🚀 === $STEP ==="
 pushd "$ROOT_DIR/lambda/hap-stripe-webhook" > /dev/null
-./build.sh
+./build.sh > /dev/null
+popd > /dev/null
+echo "   ✅ Build complete"
+
+STEP="deploy $WEBHOOK_LAMBDA_NAME"
+echo "🚀 === $STEP ==="
 aws lambda update-function-code \
   --function-name "$WEBHOOK_LAMBDA_NAME" \
-  --zip-file fileb://hap-stripe-webhook.zip
-popd > /dev/null
+  --zip-file fileb://"$ROOT_DIR/lambda/hap-stripe-webhook/hap-stripe-webhook.zip" \
+  > /dev/null
+echo "   ✅ Lambda code updated"
+echo ""
 
-echo "=== Building and deploying $AGENT_LAMBDA_NAME ==="
+# --- hap-agents-api ---
+
+STEP="build $AGENT_LAMBDA_NAME"
+echo "🚀 === $STEP ==="
 pushd "$ROOT_DIR/lambda/hap-agents-api" > /dev/null
-./build.sh
+./build.sh > /dev/null
+popd > /dev/null
+echo "   ✅ Build complete"
+
+STEP="deploy $AGENT_LAMBDA_NAME"
+echo "🚀 === $STEP ==="
 aws lambda update-function-code \
   --function-name "$AGENT_LAMBDA_NAME" \
-  --zip-file fileb://hap-agents-api.zip
-popd > /dev/null
+  --zip-file fileb://"$ROOT_DIR/lambda/hap-agents-api/hap-agents-api.zip" \
+  > /dev/null
+echo "   ✅ Lambda code updated"
+echo ""
 
 ########################################
 # 3. Sync static sites to S3           #
 ########################################
 
-echo "=== Syncing UI to S3 bucket: $TRAVEL_BUCKET ==="
-aws s3 sync "$ROOT_DIR/ui/travel" "s3://$TRAVEL_BUCKET" --delete
+STEP="sync UI to S3 bucket $TRAVEL_BUCKET"
+echo "🚀 === $STEP ==="
+aws s3 sync "$ROOT_DIR/ui/travel" "s3://$TRAVEL_BUCKET" --delete > /dev/null
+echo "   ✅ UI synced to S3"
+echo ""
 
-echo "=== Syncing agent metadata to S3 bucket: $AGENT_BUCKET ==="
-aws s3 sync "$ROOT_DIR/agent" "s3://$AGENT_BUCKET" --delete
+STEP="sync agent metadata to S3 bucket $AGENT_BUCKET"
+echo "🚀 === $STEP ==="
+aws s3 sync "$ROOT_DIR/agent" "s3://$AGENT_BUCKET" --delete > /dev/null
+echo "   ✅ Agent metadata synced to S3"
+echo ""
 
 ########################################
 # 4. Invalidate CloudFront caches      #
 ########################################
 
-echo "=== Invalidating CloudFront cache for travel ($TRAVEL_CF_ID) ==="
+STEP="invalidate CloudFront travel ($TRAVEL_CF_ID)"
+echo "🚀 === $STEP ==="
 aws cloudfront create-invalidation \
   --distribution-id "$TRAVEL_CF_ID" \
   --paths "/*" > /dev/null
+echo "   ✅ CloudFront invalidation requested for travel"
+echo ""
 
-echo "=== Invalidating CloudFront cache for agent ($AGENT_CF_ID) ==="
+STEP="invalidate CloudFront agent ($AGENT_CF_ID)"
+echo "🚀 === $STEP ==="
 aws cloudfront create-invalidation \
   --distribution-id "$AGENT_CF_ID" \
   --paths "/*" > /dev/null
+echo "   ✅ CloudFront invalidation requested for agent"
+echo ""
 
 echo "✅ Deployment complete."
