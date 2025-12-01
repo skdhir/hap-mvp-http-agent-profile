@@ -5,9 +5,11 @@ import datetime
 import decimal
 import hashlib
 import base64
+import time
 
 import boto3
 import stripe
+import requests
 from ecdsa import VerifyingKey, NIST256p, BadSignatureError
 
 # ---------- Logging setup ----------
@@ -126,6 +128,16 @@ HAP_STATS_TABLE = os.environ.get("HAP_STATS_TABLE", "hap_stats")
 AGENT_WALLETS_TABLE = os.environ.get("AGENT_WALLETS_TABLE", "HAP_AGENT_WALLETS")
 PAYMENT_SESSIONS_TABLE = os.environ.get("PAYMENT_SESSIONS_TABLE", "HAP_PAYMENT_SESSIONS")
 AGENTS_TABLE_NAME = os.environ.get("HAP_AGENTS_TABLE", "HAP_AGENTS")
+
+# --- Amadeus flight API config ---
+AMADEUS_ENABLED = os.environ.get("AMADEUS_ENABLED", "false").lower() == "true"
+AMADEUS_CLIENT_ID = os.environ.get("AMADEUS_CLIENT_ID")
+AMADEUS_CLIENT_SECRET = os.environ.get("AMADEUS_CLIENT_SECRET")
+AMADEUS_ENV = os.environ.get("AMADEUS_ENV", "test")
+
+# Simple in-memory token cache for this Lambda execution environment
+_amadeus_access_token = None
+_amadeus_token_expiry = 0.0  # epoch seconds
 
 stats_table = dynamodb.Table(HAP_STATS_TABLE)
 wallets_table = dynamodb.Table(AGENT_WALLETS_TABLE)
@@ -660,6 +672,187 @@ def handle_billing_agents(event):
     }
     return build_response(200, body)
 
+# ---------- Amadeus helpers ----------
+
+def amadeus_base_url() -> str:
+    """
+    Use the test or production base URL depending on AMADEUS_ENV.
+    """
+    if AMADEUS_ENV == "production":
+        return "https://api.amadeus.com"
+    return "https://test.api.amadeus.com"
+
+
+def get_amadeus_access_token() -> Optional[str]:
+    """
+    Get (and cache) an OAuth2 access token for Amadeus.
+    Returns None if credentials are missing or the call fails.
+    """
+    global _amadeus_access_token, _amadeus_token_expiry
+
+    if not (AMADEUS_ENABLED and AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET):
+        enabled=AMADEUS_ENABLED,
+        has_id=bool(AMADEUS_CLIENT_ID),
+        has_secret=bool(AMADEUS_CLIENT_SECRET),
+        log("amadeus_disabled", reason=f"missing_credentials, enabled/has_id/has_secret= {enabled}/{has_id}/{has_secret}")
+        return None
+
+    now = time.time()
+    # Reuse token if it exists and is not about to expire
+    if _amadeus_access_token and now < _amadeus_token_expiry - 30:
+        return _amadeus_access_token
+
+    token_url = amadeus_base_url() + "/v1/security/oauth2/token"
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": AMADEUS_CLIENT_ID,
+        "client_secret": AMADEUS_CLIENT_SECRET,
+    }
+
+    try:
+        resp = requests.post(
+            token_url,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=5,
+        )
+    except Exception as e:
+        log("amadeus_token_http_error", error=str(e))
+        return None
+
+    if resp.status_code != 200:
+        log("amadeus_token_bad_status", status=resp.status_code, body=resp.text[:300])
+        return None
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        log("amadeus_token_json_error", error=str(e), body=resp.text[:200])
+        return None
+
+    token = payload.get("access_token")
+    expires_in = int(payload.get("expires_in", 1800))
+    if not token:
+        log("amadeus_token_missing", payload=payload)
+        return None
+
+    _amadeus_access_token = token
+    _amadeus_token_expiry = now + expires_in
+    log("amadeus_token_ok", expires_in=expires_in)
+    return token
+
+
+def amadeus_search_flights(from_airport: str, to_airport: str, date: str):
+    """
+    Call Amadeus Flight Offers Search (simple GET flavor) and return
+    a list of simplified flight dicts.
+    Falls back to [] or fake flights if anything goes wrong.
+    """
+    token = get_amadeus_access_token()
+    if not token:
+        # If we can't get a token, just signal "no real data"
+        return None
+
+    url = amadeus_base_url() + "/v2/shopping/flight-offers"
+    params = {
+        "originLocationCode": from_airport,
+        "destinationLocationCode": to_airport,
+        "departureDate": date,
+        "adults": "1",
+        "max": "5",
+    }
+
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=8,
+        )
+    except Exception as e:
+        log("amadeus_search_http_error", error=str(e))
+        return None
+
+    if resp.status_code != 200:
+        log(
+            "amadeus_search_bad_status",
+            status=resp.status_code,
+            body=resp.text[:300],
+        )
+        return None
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        log("amadeus_search_json_error", error=str(e), body=resp.text[:200])
+        return None
+
+    offers = payload.get("data", [])
+    if not offers:
+        log("amadeus_search_empty", from_airport=from_airport, to_airport=to_airport, date=date)
+        return []
+
+    results = []
+
+    for offer in offers[:5]:
+        itineraries = offer.get("itineraries") or []
+        if not itineraries:
+            continue
+        itinerary = itineraries[0]
+        segments = itinerary.get("segments") or []
+        if not segments:
+            continue
+
+        first_seg = segments[0]
+        last_seg = segments[-1]
+
+        dep = first_seg.get("departure", {}) or {}
+        arr = last_seg.get("arrival", {}) or {}
+
+        carrier = first_seg.get("carrierCode")
+        number = first_seg.get("number")
+        price_info = offer.get("price") or {}
+        currency = price_info.get("currency", "USD")
+        total = price_info.get("total")
+
+        def split_dt(dt: Optional[str]):
+            if not dt or "T" not in dt:
+                return None, None
+            d, t = dt.split("T", 1)
+            return d, t[:5]
+
+        dep_date, dep_time = split_dt(dep.get("at"))
+        arr_date, arr_time = split_dt(arr.get("at"))
+
+        results.append(
+            {
+                "flightNumber": f"{carrier}{number}" if carrier and number else number or "",
+                "airline": carrier,
+                "from": dep.get("iataCode") or from_airport,
+                "to": arr.get("iataCode") or to_airport,
+                "date": dep_date or date,
+                "departureTime": dep_time,
+                "arrivalTime": arr_time,
+                "priceCurrency": currency,
+                "priceTotal": float(total) if total is not None else None,
+            }
+        )
+
+    return results
+
+
+def get_flight_results(from_airport: str, to_airport: str, date: str):
+    """
+    Main hook used by the handler:
+    - Try Amadeus first (if configured)
+    - Fallback to fake flights if Amadeus is disabled or fails
+    """
+    real = amadeus_search_flights(from_airport, to_airport, date)
+    if real is None:
+        # e.g. credentials missing or token/search error
+        return fake_flight_results(from_airport, to_airport, date)
+    return real
+
 
 def fake_flight_results(from_airport: str, to_airport: str, date: str):
     return [
@@ -713,9 +906,6 @@ def handle_flights_search(event):
         wallet = ensure_wallet(agent_id)
         current_credits = int(wallet.get("credits", 0))
 
-        wallet = ensure_wallet(agent_id)
-        current_credits = int(wallet.get("credits", 0))
-
         if current_credits <= 0:
             # Try autopay first, if enabled for this agent
             topped_up, current_credits, autopay_error = maybe_autopay_topup(agent_id, current_credits)
@@ -750,7 +940,7 @@ def handle_flights_search(event):
             "from": from_airport,
             "to": to_airport,
             "date": date,
-            "results": fake_flight_results(from_airport, to_airport, date),
+            "results": get_flight_results(from_airport, to_airport, date),
         }
         return build_response(200, body)
 
@@ -764,7 +954,7 @@ def handle_flights_search(event):
             "from": from_airport,
             "to": to_airport,
             "date": date,
-            "results": fake_flight_results(from_airport, to_airport, date),
+            "results": get_flight_results(from_airport, to_airport, date),
         }
         return build_response(200, body)
 
@@ -780,7 +970,6 @@ def handle_flights_search(event):
         "hint": "Human browsers should send a human token; agents should sign requests.",
     }
     return build_response(403, body)
-
 
 # ---------- Lambda entrypoint ----------
 
