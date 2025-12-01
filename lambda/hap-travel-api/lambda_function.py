@@ -384,7 +384,7 @@ def maybe_autopay_topup(agent_id: str, current_credits: int):
     Returns:
       (topped_up: bool, new_credits: int, error: str | None)
     """
-    # Look up agent config (autopay flags, Stripe IDs, etc.)
+    # 1) Look up agent config (autopay flags, Stripe IDs, etc.)
     try:
         resp = agents_table.get_item(Key={"agentId": agent_id})
         agent = resp.get("Item")
@@ -396,7 +396,7 @@ def maybe_autopay_topup(agent_id: str, current_credits: int):
         log("autopay_disabled_no_agent", agentId=agent_id)
         return False, current_credits, "no_agent_record"
 
-    # Is autopay enabled?
+    # 2) Is autopay enabled?
     enabled = agent.get("autopayEnabled")
     if isinstance(enabled, str):
         enabled = enabled.lower() in ("1", "true", "yes", "y")
@@ -412,13 +412,63 @@ def maybe_autopay_topup(agent_id: str, current_credits: int):
     amount_cents = int(agent.get("autopayAmountCents", AUTOPAY_DEFAULT_AMOUNT_CENTS))
     currency = agent.get("autopayCurrency", "usd")
 
-    # Create a PaymentIntent using the customer's default card, off-session
+    # 3) Figure out WHICH payment method to use
+    payment_method_id = agent.get("autopayPaymentMethodId")  # optional field in HAP_AGENTS
+
+    # 3a) If not set explicitly, try the customer's default payment method
+    if not payment_method_id:
+        try:
+            customer = stripe.Customer.retrieve(
+                customer_id,
+                expand=["invoice_settings.default_payment_method"],
+            )
+            default_pm = customer.get("invoice_settings", {}).get("default_payment_method")
+            if isinstance(default_pm, dict):
+                payment_method_id = default_pm.get("id")
+            elif isinstance(default_pm, str):
+                payment_method_id = default_pm
+        except Exception as e:
+            log(
+                "autopay_customer_retrieve_error",
+                agentId=agent_id,
+                customerId=customer_id,
+                error=str(e),
+            )
+
+    # 3b) If still nothing, fall back to "first attached card PaymentMethod"
+    if not payment_method_id:
+        try:
+            pms = stripe.PaymentMethod.list(
+                customer=customer_id,
+                type="card",
+                limit=1,
+            )
+            if pms.data:
+                payment_method_id = pms.data[0].id
+        except Exception as e:
+            log(
+                "autopay_paymentmethod_list_error",
+                agentId=agent_id,
+                customerId=customer_id,
+                error=str(e),
+            )
+
+    if not payment_method_id:
+        # At this point we truly can't figure out what to charge
+        log(
+            "autopay_missing_payment_method",
+            agentId=agent_id,
+            customerId=customer_id,
+        )
+        return False, current_credits, "missing_payment_method"
+
+    # 4) Create a PaymentIntent using that specific PaymentMethod, off-session
     try:
         intent = stripe.PaymentIntent.create(
             amount=amount_cents,
             currency=currency,
             customer=customer_id,
-            payment_method_types=["card"],
+            payment_method=payment_method_id,
             off_session=True,
             confirm=True,
             metadata={
@@ -427,11 +477,22 @@ def maybe_autopay_topup(agent_id: str, current_credits: int):
                 "credits": str(topup_credits),
             },
         )
+    except stripe.error.CardError as e:
+        # This can happen if the bank demands extra auth (3DS etc.)
+        log(
+            "autopay_card_error",
+            agentId=agent_id,
+            customerId=customer_id,
+            code=getattr(e, "code", None),
+            message=str(e),
+        )
+        return False, current_credits, f"card_error_{getattr(e, 'code', 'unknown')}"
     except Exception as e:
         log("autopay_paymentintent_error", agentId=agent_id, error=str(e))
         return False, current_credits, "stripe_error"
 
     if intent.status != "succeeded":
+        # Could be requires_action, requires_payment_method, etc.
         log(
             "autopay_payment_not_succeeded",
             agentId=agent_id,
@@ -440,9 +501,19 @@ def maybe_autopay_topup(agent_id: str, current_credits: int):
         )
         return False, current_credits, f"payment_status_{intent.status}"
 
-    # Record the autopay event in HAP_PAYMENT_SESSIONS
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # 5) Payment succeeded – actually top up the wallet
+    new_credits = change_wallet_credits(agent_id, topup_credits)
+    log(
+        "autopay_wallet_topped_up",
+        agentId=agent_id,
+        added=topup_credits,
+        credits=new_credits,
+        paymentIntentId=intent.id,
+    )
+
+    # Optional but nice: record in HAP_PAYMENT_SESSIONS so dashboard can show autopay events
     try:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         sessions_table.put_item(
             Item={
                 "sessionId": intent.id,
@@ -451,27 +522,21 @@ def maybe_autopay_topup(agent_id: str, current_credits: int):
                 "paidAt": now,
                 "creditsPurchased": decimal.Decimal(topup_credits),
                 "status": "succeeded",
-                "mode": "autopay",
-                "paymentIntentId": intent.id,
+                "mode": "auto",
             }
         )
         log(
             "autopay_session_recorded",
-            sessionId=intent.id,
             agentId=agent_id,
-            credits=topup_credits,
+            sessionId=intent.id,
         )
     except Exception as e:
-        log("autopay_sessions_put_error", agentId=agent_id, error=str(e))
-
-    # Actually top up the wallet
-    new_credits = change_wallet_credits(agent_id, topup_credits)
-    log(
-        "autopay_wallet_topped_up",
-        agentId=agent_id,
-        added=topup_credits,
-        credits=new_credits,
-    )
+        log(
+            "autopay_session_put_error",
+            agentId=agent_id,
+            sessionId=intent.id,
+            error=str(e),
+        )
 
     return True, new_credits, None
 
