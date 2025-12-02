@@ -1,3 +1,6 @@
+import uuid
+import time
+import secrets
 import json
 import os
 import logging
@@ -45,6 +48,8 @@ def b64url_decode(s: str) -> bytes:
     padding = "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s + padding)
 
+def b64url_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
 
 def load_verifying_key_from_jwk(jwk: dict) -> VerifyingKey:
     """
@@ -119,6 +124,90 @@ def get_header_map(event):
 def today_iso():
     return datetime.date.today().isoformat()
 
+# ---------- Simple auth helpers (MVP-grade) ----------
+
+def hash_password(password: str) -> str:
+    """
+    Hash password with PBKDF2-HMAC-SHA256.
+    Returns salt:hash in base64url.
+    """
+    if not password:
+        raise ValueError("Password required")
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return f"{b64url_encode(salt)}:{b64url_encode(dk)}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_b64, hash_b64 = stored.split(":", 1)
+        salt = b64url_decode(salt_b64)
+        stored_dk = b64url_decode(hash_b64)
+    except Exception:
+        return False
+
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return hmac.compare_digest(stored_dk, dk)
+
+
+def sign_token(payload: dict) -> str:
+    """
+    Very simple HMAC-signed token.
+    token = base64(payload_json) + "." + base64(sig)
+    where sig = HMAC-SHA256(secret, payload_json)
+    """
+    if not HAP_AUTH_SECRET:
+        raise RuntimeError("HAP_AUTH_SECRET not configured")
+
+    data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    sig = hmac.new(HAP_AUTH_SECRET.encode("utf-8"), data, hashlib.sha256).digest()
+    return f"{b64url_encode(data)}.{b64url_encode(sig)}"
+
+
+def verify_token(token: str):
+    """
+    Returns payload dict if valid & not expired, else None.
+    """
+    if not HAP_AUTH_SECRET or not token:
+        return None
+    try:
+        data_b64, sig_b64 = token.split(".", 1)
+    except ValueError:
+        return None
+
+    try:
+        data = b64url_decode(data_b64)
+        sig = b64url_decode(sig_b64)
+    except Exception:
+        return None
+
+    expected_sig = hmac.new(HAP_AUTH_SECRET.encode("utf-8"), data, hashlib.sha256).digest()
+    if not hmac.compare_digest(sig, expected_sig):
+        return None
+
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+    exp = payload.get("exp")
+    if exp and time.time() > float(exp):
+        return None
+
+    return payload
+
+
+def get_current_user(event):
+    """
+    Reads Authorization: Bearer <token> from headers
+    and returns payload (incl. "sub" email) or None.
+    """
+    headers = get_header_map(event)
+    auth = headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return None
+    token = auth.split(" ", 1)[1]
+    return verify_token(token)
 
 # ---------- AWS + Stripe clients ----------
 
@@ -128,6 +217,8 @@ HAP_STATS_TABLE = os.environ.get("HAP_STATS_TABLE", "hap_stats")
 AGENT_WALLETS_TABLE = os.environ.get("AGENT_WALLETS_TABLE", "HAP_AGENT_WALLETS")
 PAYMENT_SESSIONS_TABLE = os.environ.get("PAYMENT_SESSIONS_TABLE", "HAP_PAYMENT_SESSIONS")
 AGENTS_TABLE_NAME = os.environ.get("HAP_AGENTS_TABLE", "HAP_AGENTS")
+USERS_TABLE_NAME = os.environ.get("HAP_USERS_TABLE", "HAP_USERS")  # <--- add this
+HAP_AUTH_SECRET = os.environ.get("HAP_AUTH_SECRET", "")
 
 # --- Amadeus flight API config ---
 AMADEUS_ENABLED = os.environ.get("AMADEUS_ENABLED", "false").lower() == "true"
@@ -143,6 +234,7 @@ stats_table = dynamodb.Table(HAP_STATS_TABLE)
 wallets_table = dynamodb.Table(AGENT_WALLETS_TABLE)
 sessions_table = dynamodb.Table(PAYMENT_SESSIONS_TABLE)
 agents_table = dynamodb.Table(AGENTS_TABLE_NAME)
+users_table = dynamodb.Table(USERS_TABLE_NAME)  # <--- add this
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 # Default autopay amount if not overridden per agent (in cents)
@@ -553,6 +645,125 @@ def maybe_autopay_topup(agent_id: str, current_credits: int):
     return True, new_credits, None
 
 # ---------- Handlers ----------
+
+def handle_auth_signup(event):
+    """
+    POST /api/auth/signup
+    Body: { "email": "...", "password": "..." }
+    """
+    try:
+        body_raw = event.get("body") or ""
+        if event.get("isBase64Encoded"):
+            body_raw = base64.b64decode(body_raw).decode("utf-8")
+        data = json.loads(body_raw) if body_raw else {}
+    except Exception:
+        return build_response(400, {"status": "bad_request", "message": "Invalid JSON body"})
+
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if not email or "@" not in email:
+        return build_response(400, {"status": "bad_request", "message": "Valid email required"})
+    if not password or len(password) < 8:
+        return build_response(400, {"status": "bad_request", "message": "Password must be at least 8 characters"})
+
+    # Check if user exists
+    try:
+        resp = users_table.get_item(Key={"email": email})
+        if "Item" in resp:
+            return build_response(409, {"status": "conflict", "message": "User already exists"})
+    except Exception as e:
+        log("auth_signup_get_error", error=str(e))
+        return build_response(500, {"status": "error", "message": "Internal error"})
+
+    try:
+        pw_hash = hash_password(password)
+    except Exception as e:
+        log("auth_signup_hash_error", error=str(e))
+        return build_response(500, {"status": "error", "message": "Internal error"})
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    item = {
+        "email": email,
+        "passwordHash": pw_hash,
+        "createdAt": now,
+    }
+
+    try:
+        users_table.put_item(Item=item)
+        log("auth_user_created", email=email)
+    except Exception as e:
+        log("auth_signup_put_error", error=str(e))
+        return build_response(500, {"status": "error", "message": "Internal error"})
+
+    # Issue token immediately
+    payload = {
+        "sub": email,
+        "email": email,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 7 * 24 * 3600,  # 7 days
+    }
+    token = sign_token(payload)
+
+    return build_response(
+        200,
+        {
+            "status": "ok",
+            "user": {"email": email},
+            "token": token,
+        },
+    )
+
+def handle_auth_login(event):
+    """
+    POST /api/auth/login
+    Body: { "email": "...", "password": "..." }
+    """
+    try:
+        body_raw = event.get("body") or ""
+        if event.get("isBase64Encoded"):
+            body_raw = base64.b64decode(body_raw).decode("utf-8")
+        data = json.loads(body_raw) if body_raw else {}
+    except Exception:
+        return build_response(400, {"status": "bad_request", "message": "Invalid JSON body"})
+
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if not email or not password:
+        return build_response(400, {"status": "bad_request", "message": "Email and password required"})
+
+    try:
+        resp = users_table.get_item(Key={"email": email})
+        item = resp.get("Item")
+    except Exception as e:
+        log("auth_login_get_error", error=str(e))
+        return build_response(500, {"status": "error", "message": "Internal error"})
+
+    if not item:
+        return build_response(401, {"status": "unauthorized", "message": "Invalid credentials"})
+
+    pw_hash = item.get("passwordHash")
+    if not verify_password(password, pw_hash or ""):
+        return build_response(401, {"status": "unauthorized", "message": "Invalid credentials"})
+
+    payload = {
+        "sub": email,
+        "email": email,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 7 * 24 * 3600,
+    }
+    token = sign_token(payload)
+
+    return build_response(
+        200,
+        {
+            "status": "ok",
+            "user": {"email": email},
+            "token": token,
+        },
+    )
 
 def handle_stats_summary(event):
     """
@@ -1000,6 +1211,10 @@ def lambda_handler(event, context):
             return handle_stats_summary(event)
         if raw_path == "/api/billing/agents" and method == "GET":
             return handle_billing_agents(event)
+        if raw_path == "/api/auth/signup" and method == "POST":
+            return handle_auth_signup(event)
+        if raw_path == "/api/auth/login" and method == "POST":
+            return handle_auth_login(event)
 
         # default 404
         return build_response(

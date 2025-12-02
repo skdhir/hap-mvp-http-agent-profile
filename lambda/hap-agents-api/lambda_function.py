@@ -3,15 +3,66 @@ import json
 import base64
 import uuid
 from datetime import datetime, timezone
+import time
+import hmac
+import hashlib
 
 import boto3
 from ecdsa import SigningKey, NIST256p
+
+# --- helpers ---
 
 # --- helpers ---
 def base64url(raw: bytes) -> str:
     """Base64 URL-safe, no padding (JWK style)."""
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
+
+def b64url_decode(s: str) -> bytes:
+    """Base64 URL-safe decode with padding fix."""
+    padding = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + padding)
+
+
+def verify_token(token: str):
+    """
+    Verify HMAC-signed token issued by your auth service.
+
+    token = base64(payload_json) + "." + base64(sig)
+    where sig = HMAC-SHA256(HAP_AUTH_SECRET, payload_json)
+    """
+    if not HAP_AUTH_SECRET or not token:
+        return None
+
+    try:
+        data_b64, sig_b64 = token.split(".", 1)
+    except ValueError:
+        return None
+
+    try:
+        data = b64url_decode(data_b64)
+        sig = b64url_decode(sig_b64)
+    except Exception:
+        return None
+
+    expected_sig = hmac.new(
+        HAP_AUTH_SECRET.encode("utf-8"), data, hashlib.sha256
+    ).digest()
+
+    if not hmac.compare_digest(sig, expected_sig):
+        return None
+
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+    # Optional: expiry check (expects "exp" in seconds)
+    exp = payload.get("exp")
+    if exp and time.time() > float(exp):
+        return None
+
+    return payload
 
 def generate_keypair():
     """
@@ -54,6 +105,7 @@ dynamodb = boto3.resource("dynamodb")
 AGENTS_TABLE_NAME = os.environ.get("HAP_AGENTS_TABLE", "HAP_AGENTS")
 agents_table = dynamodb.Table(AGENTS_TABLE_NAME)
 
+HAP_AUTH_SECRET = os.environ.get("HAP_AUTH_SECRET", "")
 
 # --- Lambda handler ---
 dynamodb = boto3.resource("dynamodb")
@@ -68,8 +120,58 @@ def lambda_handler(event, context):
     if method != "POST":
         return {
             "statusCode": 405,
-            "headers": {"Allow": "POST"},
+            "headers": {
+                "Allow": "POST",
+                "Access-Control-Allow-Origin": "*",
+            },
             "body": "Method not allowed",
+        }
+
+    # --- authenticate caller (agent developer) ---
+    headers = event.get("headers") or {}
+    headers_lower = { (k or "").lower(): v for k, v in headers.items() }
+
+    auth = headers_lower.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return {
+            "statusCode": 401,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+            },
+            "body": json.dumps({
+                "status": "unauthorized",
+                "message": "Missing Authorization Bearer token",
+            }),
+        }
+
+    token = auth.split(" ", 1)[1]
+    payload = verify_token(token)
+    if not payload:
+        return {
+            "statusCode": 401,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+            },
+            "body": json.dumps({
+                "status": "unauthorized",
+                "message": "Invalid or expired token",
+            }),
+        }
+
+    owner_email = (payload.get("sub") or payload.get("email") or "").strip().lower()
+    if not owner_email:
+        return {
+            "statusCode": 401,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+            },
+            "body": json.dumps({
+                "status": "unauthorized",
+                "message": "Token missing subject/email",
+            }),
         }
 
     # 1) Generate keypair
@@ -85,6 +187,7 @@ def lambda_handler(event, context):
         "publicKeyJwk": public_jwk,
         "class": "agent",
         "status": "active",
+        "ownerEmail": owner_email,
         "createdAt": now_iso(),
     }
 
@@ -97,6 +200,7 @@ def lambda_handler(event, context):
         "publicKeyJwk": public_jwk,
         # Important: only returned once – agent must store it securely.
         "privateKeyBase64": private_b64,
+        "ownerEmail": owner_email,
         "createdAt": item["createdAt"],
     }
 
