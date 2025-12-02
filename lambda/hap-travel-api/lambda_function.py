@@ -8,6 +8,7 @@ import datetime
 import decimal
 import hashlib
 import base64
+import hmac
 import time
 
 import boto3
@@ -21,7 +22,6 @@ logger = logging.getLogger()
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 logger.setLevel(logging.INFO)
-
 
 def log(event_name: str, **fields):
     """
@@ -126,63 +126,58 @@ def today_iso():
 
 # ---------- Simple auth helpers (MVP-grade) ----------
 
+# ---------- User auth (email/password + HMAC token) ----------
+
 def hash_password(password: str) -> str:
     """
-    Hash password with PBKDF2-HMAC-SHA256.
-    Returns salt:hash in base64url.
+    Very simple salted hash:
+      stored as "<salt>$<hex_sha256(salt+password)>"
+    Good enough for MVP; you can swap to PBKDF2/argon2 later.
     """
-    if not password:
-        raise ValueError("Password required")
-    salt = secrets.token_bytes(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
-    return f"{b64url_encode(salt)}:{b64url_encode(dk)}"
+    salt = b64url_encode(os.urandom(16))
+    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return f"{salt}${digest}"
 
 
-def verify_password(password: str, stored: str) -> bool:
+def verify_password(password: str, stored_hash: str) -> bool:
     try:
-        salt_b64, hash_b64 = stored.split(":", 1)
-        salt = b64url_decode(salt_b64)
-        stored_dk = b64url_decode(hash_b64)
-    except Exception:
+        salt, digest = stored_hash.split("$", 1)
+    except ValueError:
         return False
-
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
-    return hmac.compare_digest(stored_dk, dk)
+    test = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return hmac.compare_digest(digest, test)
 
 
 def sign_token(payload: dict) -> str:
     """
-    Very simple HMAC-signed token.
-    token = base64(payload_json) + "." + base64(sig)
-    where sig = HMAC-SHA256(secret, payload_json)
+    Sign a small JSON payload with HAP_AUTH_SECRET.
+
+    Token format: base64url(payload_json) + "." + base64url(hmac_sha256(payload_json)).
     """
     if not HAP_AUTH_SECRET:
-        raise RuntimeError("HAP_AUTH_SECRET not configured")
+        raise RuntimeError("HAP_AUTH_SECRET is not configured")
 
     data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     sig = hmac.new(HAP_AUTH_SECRET.encode("utf-8"), data, hashlib.sha256).digest()
     return f"{b64url_encode(data)}.{b64url_encode(sig)}"
 
 
-def verify_token(token: str):
+def verify_token(token: str) -> dict | None:
     """
-    Returns payload dict if valid & not expired, else None.
+    Verify token and return payload dict, or None if invalid/expired.
     """
-    if not HAP_AUTH_SECRET or not token:
-        return None
-    try:
-        data_b64, sig_b64 = token.split(".", 1)
-    except ValueError:
+    if not HAP_AUTH_SECRET:
         return None
 
     try:
+        data_b64, sig_b64 = token.split(".", 1)
         data = b64url_decode(data_b64)
         sig = b64url_decode(sig_b64)
     except Exception:
         return None
 
     expected_sig = hmac.new(HAP_AUTH_SECRET.encode("utf-8"), data, hashlib.sha256).digest()
-    if not hmac.compare_digest(sig, expected_sig):
+    if not hmac.compare_digest(expected_sig, sig):
         return None
 
     try:
@@ -190,12 +185,13 @@ def verify_token(token: str):
     except Exception:
         return None
 
+    # Optional: expiry check
+    now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     exp = payload.get("exp")
-    if exp and time.time() > float(exp):
+    if exp is not None and now_ts > int(exp):
         return None
 
     return payload
-
 
 def get_current_user(event):
     """
@@ -652,57 +648,56 @@ def handle_auth_signup(event):
     Body: { "email": "...", "password": "..." }
     """
     try:
-        body_raw = event.get("body") or ""
-        if event.get("isBase64Encoded"):
-            body_raw = base64.b64decode(body_raw).decode("utf-8")
-        data = json.loads(body_raw) if body_raw else {}
+        body = json.loads(event.get("body") or "{}")
     except Exception:
-        return build_response(400, {"status": "bad_request", "message": "Invalid JSON body"})
+        return build_response(400, {"status": "error", "message": "Invalid JSON"})
 
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
 
-    if not email or "@" not in email:
-        return build_response(400, {"status": "bad_request", "message": "Valid email required"})
-    if not password or len(password) < 8:
-        return build_response(400, {"status": "bad_request", "message": "Password must be at least 8 characters"})
+    if not email or not password:
+        return build_response(
+            400,
+            {"status": "error", "message": "email and password are required"},
+        )
 
-    # Check if user exists
+    # Check if user already exists
     try:
-        resp = users_table.get_item(Key={"email": email})
-        if "Item" in resp:
-            return build_response(409, {"status": "conflict", "message": "User already exists"})
+        existing = users_table.get_item(Key={"email": email}).get("Item")
     except Exception as e:
-        log("auth_signup_get_error", error=str(e))
-        return build_response(500, {"status": "error", "message": "Internal error"})
+        log("signup_dynamo_error", email=email, error=str(e))
+        return build_response(500, {"status": "error", "message": "DynamoDB error"})
 
-    try:
-        pw_hash = hash_password(password)
-    except Exception as e:
-        log("auth_signup_hash_error", error=str(e))
-        return build_response(500, {"status": "error", "message": "Internal error"})
+    if existing:
+        return build_response(
+            409,
+            {"status": "error", "message": "User already exists"},
+        )
 
+    user_id = "user_" + uuid.uuid4().hex
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    password_hash = hash_password(password)
 
     item = {
         "email": email,
-        "passwordHash": pw_hash,
+        "userId": user_id,
+        "passwordHash": password_hash,
         "createdAt": now,
+        "updatedAt": now,
     }
 
     try:
         users_table.put_item(Item=item)
-        log("auth_user_created", email=email)
     except Exception as e:
-        log("auth_signup_put_error", error=str(e))
-        return build_response(500, {"status": "error", "message": "Internal error"})
+        log("signup_put_error", email=email, error=str(e))
+        return build_response(500, {"status": "error", "message": "Failed to create user"})
 
-    # Issue token immediately
+    now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     payload = {
-        "sub": email,
+        "sub": user_id,
         "email": email,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 7 * 24 * 3600,  # 7 days
+        "iat": now_ts,
+        "exp": now_ts + 7 * 24 * 3600,  # 7 days
     }
     token = sign_token(payload)
 
@@ -710,10 +705,12 @@ def handle_auth_signup(event):
         200,
         {
             "status": "ok",
-            "user": {"email": email},
+            "userId": user_id,
+            "email": email,
             "token": token,
         },
     )
+
 
 def handle_auth_login(event):
     """
@@ -721,38 +718,50 @@ def handle_auth_login(event):
     Body: { "email": "...", "password": "..." }
     """
     try:
-        body_raw = event.get("body") or ""
-        if event.get("isBase64Encoded"):
-            body_raw = base64.b64decode(body_raw).decode("utf-8")
-        data = json.loads(body_raw) if body_raw else {}
+        body = json.loads(event.get("body") or "{}")
     except Exception:
-        return build_response(400, {"status": "bad_request", "message": "Invalid JSON body"})
+        return build_response(400, {"status": "error", "message": "Invalid JSON"})
 
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
 
     if not email or not password:
-        return build_response(400, {"status": "bad_request", "message": "Email and password required"})
+        return build_response(
+            400,
+            {"status": "error", "message": "email and password are required"},
+        )
 
     try:
         resp = users_table.get_item(Key={"email": email})
-        item = resp.get("Item")
+        user = resp.get("Item")
     except Exception as e:
-        log("auth_login_get_error", error=str(e))
-        return build_response(500, {"status": "error", "message": "Internal error"})
+        log("login_dynamo_error", email=email, error=str(e))
+        return build_response(500, {"status": "error", "message": "DynamoDB error"})
 
-    if not item:
-        return build_response(401, {"status": "unauthorized", "message": "Invalid credentials"})
+    if not user or not verify_password(password, user.get("passwordHash", "")):
+        return build_response(
+            401,
+            {"status": "error", "message": "Invalid credentials"},
+        )
 
-    pw_hash = item.get("passwordHash")
-    if not verify_password(password, pw_hash or ""):
-        return build_response(401, {"status": "unauthorized", "message": "Invalid credentials"})
+    # Update lastLoginAt (non-critical if it fails)
+    try:
+        users_table.update_item(
+            Key={"email": email},
+            UpdateExpression="SET lastLoginAt = :ts, updatedAt = :ts",
+            ExpressionAttributeValues={
+                ":ts": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            },
+        )
+    except Exception as e:
+        log("login_update_error", email=email, error=str(e))
 
+    now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     payload = {
-        "sub": email,
+        "sub": user["userId"],
         "email": email,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 7 * 24 * 3600,
+        "iat": now_ts,
+        "exp": now_ts + 7 * 24 * 3600,
     }
     token = sign_token(payload)
 
@@ -760,7 +769,8 @@ def handle_auth_login(event):
         200,
         {
             "status": "ok",
-            "user": {"email": email},
+            "userId": user["userId"],
+            "email": email,
             "token": token,
         },
     )
