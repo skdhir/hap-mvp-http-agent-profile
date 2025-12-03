@@ -11,7 +11,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 1. Load environment config           #
 ########################################
 
-ENVIRONMENT=${1:-dev}  # default env is "dev"
+ENVIRONMENT=${1:-dev}          # first arg: env (dev/prod/etc.)
+FORCE_BUILD_FLAG=${2:-""}      # second arg: "force" (optional)
+
 ENV_FILE="$ROOT_DIR/config/env.${ENVIRONMENT}.sh"
 
 if [ ! -f "$ENV_FILE" ]; then
@@ -31,115 +33,143 @@ if [ -n "${AWS_PROFILE:-}" ]; then
   export AWS_PROFILE
 fi
 
-# Track which step we're on so errors are easier to see
-STEP="initialization"
-trap 'echo ""; echo "❌ Deployment failed during: $STEP"; echo ""; exit 1' ERR
+# Should we force rebuilds?
+FORCE_ALL_BUILDS=0
+if [ "$FORCE_BUILD_FLAG" = "force" ]; then
+  FORCE_ALL_BUILDS=1
+fi
 
 echo "🚀 Deploying HAP Travel – environment: $ENVIRONMENT"
 echo "   AWS_PROFILE=${AWS_PROFILE:-default}, AWS_REGION=${AWS_REGION:-default}"
-echo ""
+echo "   FORCE_ALL_BUILDS=${FORCE_ALL_BUILDS}"
 echo "   TRAVEL_BUCKET     = $TRAVEL_BUCKET"
 echo "   AGENT_BUCKET      = $AGENT_BUCKET"
 echo "   TRAVEL_LAMBDA     = $TRAVEL_LAMBDA_NAME"
 echo "   WEBHOOK_LAMBDA    = $WEBHOOK_LAMBDA_NAME"
 echo "   AGENT_LAMBDA      = $AGENT_LAMBDA_NAME"
-echo "   TRAVEL_CF_ID      = $TRAVEL_CF_ID"
-echo "   AGENT_CF_ID       = $AGENT_CF_ID"
 echo ""
+
+##################################################
+# Helper: build react/ts ui code if changed      #
+##################################################
+
+cd ui/agentpassport && npm install && npm run build
+
+########################################
+# Helper: build+deploy if changed      #
+########################################
+
+build_and_deploy_lambda_if_changed() {
+  local label="$1"          # e.g. hap-travel-api
+  local dir="$2"            # e.g. $ROOT_DIR/lambda/hap-travel-api
+  local zip_name="$3"       # e.g. hap-travel-api.zip
+  local function_name="$4"  # e.g. $TRAVEL_LAMBDA_NAME
+
+  echo "=== Lambda: $function_name ($label) ==="
+  local zip_path="$dir/$zip_name"
+
+  local need_build=0
+
+  if [ "$FORCE_ALL_BUILDS" -eq 1 ]; then
+    echo "   Force flag set → build regardless of timestamps."
+    need_build=1
+  elif [ ! -f "$zip_path" ]; then
+    echo "   No existing zip found → will build."
+    need_build=1
+  else
+    # Any .py or requirements.txt newer than the zip?
+    if find "$dir" \
+        -type f \( -name '*.py' -o -name 'requirements.txt' -o -name 'build.sh' \) \
+        -newer "$zip_path" | grep -q .; then
+      echo "   Source changes detected → will build."
+      need_build=1
+    fi
+  fi
+
+  if [ "$need_build" -eq 1 ]; then
+    echo "   Building package..."
+    (cd "$dir" && ./build.sh > /dev/null)
+    echo "   Deploying to Lambda..."
+    aws lambda update-function-code \
+      --function-name "$function_name" \
+      --zip-file fileb://"$zip_path" \
+      > /dev/null
+    echo "   ✅ Built and deployed $function_name"
+  else
+    echo "   No code/requirements changes detected → skipping build & deploy."
+  fi
+
+  echo ""
+}
 
 ########################################
 # 2. Build and deploy Lambdas          #
 ########################################
 
-# --- hap-travel-api ---
+build_and_deploy_lambda_if_changed \
+  "hap-travel-api" \
+  "$ROOT_DIR/lambda/hap-travel-api" \
+  "hap-travel-api.zip" \
+  "$TRAVEL_LAMBDA_NAME"
 
-STEP="build $TRAVEL_LAMBDA_NAME"
-echo "🚀 === $STEP ==="
-pushd "$ROOT_DIR/lambda/hap-travel-api" > /dev/null
-# Hide noisy build stdout, but keep errors on stderr visible
-./build.sh > /dev/null
-popd > /dev/null
-echo "   ✅ Build complete"
+build_and_deploy_lambda_if_changed \
+  "hap-stripe-webhook" \
+  "$ROOT_DIR/lambda/hap-stripe-webhook" \
+  "hap-stripe-webhook.zip" \
+  "$WEBHOOK_LAMBDA_NAME"
 
-STEP="deploy $TRAVEL_LAMBDA_NAME"
-echo "🚀 === $STEP ==="
-aws lambda update-function-code \
-  --function-name "$TRAVEL_LAMBDA_NAME" \
-  --zip-file fileb://"$ROOT_DIR/lambda/hap-travel-api/hap-travel-api.zip" \
-  > /dev/null
-echo "   ✅ Lambda code updated"
-echo ""
-
-# --- hap-stripe-webhook ---
-
-STEP="build $WEBHOOK_LAMBDA_NAME"
-echo "🚀 === $STEP ==="
-pushd "$ROOT_DIR/lambda/hap-stripe-webhook" > /dev/null
-./build.sh > /dev/null
-popd > /dev/null
-echo "   ✅ Build complete"
-
-STEP="deploy $WEBHOOK_LAMBDA_NAME"
-echo "🚀 === $STEP ==="
-aws lambda update-function-code \
-  --function-name "$WEBHOOK_LAMBDA_NAME" \
-  --zip-file fileb://"$ROOT_DIR/lambda/hap-stripe-webhook/hap-stripe-webhook.zip" \
-  > /dev/null
-echo "   ✅ Lambda code updated"
-echo ""
-
-# --- hap-agents-api ---
-
-STEP="build $AGENT_LAMBDA_NAME"
-echo "🚀 === $STEP ==="
-pushd "$ROOT_DIR/lambda/hap-agents-api" > /dev/null
-./build.sh > /dev/null
-popd > /dev/null
-echo "   ✅ Build complete"
-
-STEP="deploy $AGENT_LAMBDA_NAME"
-echo "🚀 === $STEP ==="
-aws lambda update-function-code \
-  --function-name "$AGENT_LAMBDA_NAME" \
-  --zip-file fileb://"$ROOT_DIR/lambda/hap-agents-api/hap-agents-api.zip" \
-  > /dev/null
-echo "   ✅ Lambda code updated"
-echo ""
+build_and_deploy_lambda_if_changed \
+  "hap-agents-api" \
+  "$ROOT_DIR/lambda/hap-agents-api" \
+  "hap-agents-api.zip" \
+  "$AGENT_LAMBDA_NAME"
 
 ########################################
 # 3. Sync static sites to S3           #
 ########################################
 
-STEP="sync UI to S3 bucket $TRAVEL_BUCKET"
-echo "🚀 === $STEP ==="
-aws s3 sync "$ROOT_DIR/ui/travel" "s3://$TRAVEL_BUCKET" --delete > /dev/null
-echo "   ✅ UI synced to S3"
+echo "=== Syncing UI to S3 bucket: $TRAVEL_BUCKET ==="
+aws s3 sync "$ROOT_DIR/ui/travel" "s3://$TRAVEL_BUCKET" \
+  --delete \
+  --only-show-errors \
+  --no-progress
+echo "   ✅ UI sync complete"
 echo ""
 
-STEP="sync agent metadata to S3 bucket $AGENT_BUCKET"
-echo "🚀 === $STEP ==="
-aws s3 sync "$ROOT_DIR/agent" "s3://$AGENT_BUCKET" --delete > /dev/null
-echo "   ✅ Agent metadata synced to S3"
+echo "=== Syncing agent metadata to S3 bucket: $AGENT_BUCKET ==="
+aws s3 sync "$ROOT_DIR/agent" "s3://$AGENT_BUCKET" \
+  --delete \
+  --only-show-errors \
+  --no-progress
+echo "   ✅ Agent metadata sync complete"
+echo ""
+
+echo "=== Syncing React UI to S3 bucket: $TRAVEL_BUCKET/agentpassport ==="
+aws s3 sync "$ROOT_DIR/ui/agentpassport/dist" "s3://$TRAVEL_BUCKET/agentpassport" \
+  --delete \
+  --only-show-errors \
+  --no-progress
+echo "   ✅ React UI sync complete"
 echo ""
 
 ########################################
 # 4. Invalidate CloudFront caches      #
 ########################################
 
-STEP="invalidate CloudFront travel ($TRAVEL_CF_ID)"
-echo "🚀 === $STEP ==="
+echo "=== Invalidating CloudFront cache for travel ($TRAVEL_CF_ID) ==="
 aws cloudfront create-invalidation \
   --distribution-id "$TRAVEL_CF_ID" \
-  --paths "/*" > /dev/null
-echo "   ✅ CloudFront invalidation requested for travel"
+  --paths "/*" \
+  > /dev/null
+echo "   ✅ Travel CloudFront invalidation requested"
 echo ""
 
-STEP="invalidate CloudFront agent ($AGENT_CF_ID)"
-echo "🚀 === $STEP ==="
+echo "=== Invalidating CloudFront cache for agent ($AGENT_CF_ID) ==="
 aws cloudfront create-invalidation \
   --distribution-id "$AGENT_CF_ID" \
-  --paths "/*" > /dev/null
-echo "   ✅ CloudFront invalidation requested for agent"
+  --paths "/*" \
+  > /dev/null
+echo "   ✅ Agent CloudFront invalidation requested"
 echo ""
 
-echo "✅ Deployment complete."
+echo "🎉 ✅ Deployment COMPLETE for environment: $ENVIRONMENT"

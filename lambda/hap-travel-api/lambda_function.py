@@ -15,6 +15,7 @@ import boto3
 import stripe
 import requests
 from ecdsa import VerifyingKey, NIST256p, BadSignatureError
+from boto3.dynamodb.conditions import Attr
 
 # ---------- Logging setup ----------
 
@@ -642,6 +643,75 @@ def maybe_autopay_topup(agent_id: str, current_credits: int):
 
 # ---------- Handlers ----------
 
+def handle_agents_list(event):
+    """
+    GET /api/agents
+
+    Returns agents owned by the currently logged-in user.
+
+    Auth:
+      Authorization: Bearer <token-from-/api/auth/login>
+
+    Response:
+      { "status": "ok", "agents": [ ... ] }
+    """
+    # 1) Extract and verify token
+    headers = event.get("headers") or {}
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    auth = auth.strip()
+
+    if not auth.lower().startswith("bearer "):
+        return build_response(
+            401,
+            {"status": "unauthorized", "message": "Login required (missing Bearer token)"},
+        )
+
+    token = auth.split(" ", 1)[1].strip()
+    payload = verify_token(token)
+    if not payload:
+        return build_response(
+            401,
+            {"status": "unauthorized", "message": "Invalid or expired token"},
+        )
+
+    owner_email = (payload.get("email") or "").strip().lower()
+    if not owner_email:
+        return build_response(
+            401,
+            {"status": "unauthorized", "message": "Token missing email"},
+        )
+
+    # 2) Scan HAP_AGENTS for this ownerEmail (MVP; can optimize later with a GSI)
+    try:
+        resp = agents_table.scan(
+            FilterExpression=Attr("ownerEmail").eq(owner_email)
+        )
+        items = resp.get("Items") or []
+    except Exception as e:
+        log("agents_list_error", error=str(e), ownerEmail=owner_email)
+        return build_response(
+            500,
+            {"status": "error", "message": "Error loading agents"},
+        )
+
+    # 3) Shape the response
+    agents = []
+    for item in items:
+        agents.append(
+            {
+                "agentId": item.get("agentId"),
+                "keyId": item.get("keyId"),
+                "ownerEmail": item.get("ownerEmail"),
+                "ownerUserId": item.get("ownerUserId"),
+                "status": item.get("status"),
+                "createdAt": item.get("createdAt"),
+                # You *can* include publicKeyJwk if you want:
+                # "publicKeyJwk": item.get("publicKeyJwk"),
+            }
+        )
+
+    return build_response(200, {"status": "ok", "agents": agents})
+
 def handle_auth_signup(event):
     """
     POST /api/auth/signup
@@ -1225,6 +1295,8 @@ def lambda_handler(event, context):
             return handle_auth_signup(event)
         if raw_path == "/api/auth/login" and method == "POST":
             return handle_auth_login(event)
+        if raw_path == "/api/agents" and method == "GET":
+            return handle_agents_list(event)
 
         # default 404
         return build_response(

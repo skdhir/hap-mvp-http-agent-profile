@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Agent Gateway API Explorer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+    header {
+      padding: 16px 24px;
+      background: #020617;
+      border-bottom: 1px solid #1e293b;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 18px;
+    }
+    header .subtitle {
+      font-size: 12px;
+      color: #9ca3af;
+    }
+    main {
+      display: flex;
+      height: calc(100vh - 64px);
+    }
+    nav {
+      width: 260px;
+      border-right: 1px solid #1e293b;
+      padding: 16px;
+      box-sizing: border-box;
+      overflow-y: auto;
+      background: #020617;
+    }
+    nav h2 {
+      font-size: 14px;
+      margin: 0 0 8px 0;
+      color: #9ca3af;
+      text-transform: uppercase;
+    }
+    nav button {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: none;
+      color: #e5e7eb;
+      padding: 8px 4px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    nav button:hover {
+      background: #111827;
+    }
+    nav button.active {
+      background: #1d4ed8;
+    }
+    section {
+      flex: 1;
+      padding: 16px;
+      box-sizing: border-box;
+      overflow-y: auto;
+    }
+    .card {
+      background: #020617;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .card h3 {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+    }
+    .card p {
+      margin: 4px 0;
+      font-size: 13px;
+      color: #9ca3af;
+    }
+    .field {
+      margin-bottom: 8px;
+    }
+    .field label {
+      display: block;
+      font-size: 12px;
+      margin-bottom: 2px;
+      color: #9ca3af;
+    }
+    .field input {
+      width: 100%;
+      padding: 6px 8px;
+      border-radius: 4px;
+      border: 1px solid #1f2937;
+      background: #020617;
+      color: #e5e7eb;
+      box-sizing: border-box;
+    }
+    .field input:focus {
+      outline: none;
+      border-color: #3b82f6;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 10px;
+      border-radius: 4px;
+      border: 1px solid #1f2937;
+      background: #1d4ed8;
+      color: white;
+      cursor: pointer;
+      font-size: 13px;
+      margin-right: 6px;
+    }
+    .btn.secondary {
+      background: #111827;
+      color: #e5e7eb;
+    }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    pre {
+      background: #020617;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 12px;
+      overflow-x: auto;
+      border: 1px solid #1e293b;
+      max-height: 40vh;
+    }
+    .tag {
+      display: inline-block;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      border: 1px solid #1f2937;
+      color: #9ca3af;
+      margin-left: 6px;
+    }
+    .status-bar {
+      font-size: 11px;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+    .status-bar strong {
+      color: #e5e7eb;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #0f172a;
+      border: 1px solid #1f2937;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Agent Gateway API Explorer</h1>
+      <div class="subtitle">Live against https://api.sanatdhir.com</div>
+    </div>
+    <div id="auth-status" class="pill">
+      <span id="auth-status-label">Not logged in</span>
+    </div>
+  </header>
+
+  <main>
+    <nav>
+      <h2>Sections</h2>
+      <button id="nav-auth" class="active" onclick="showSection('auth')">Auth (signup / login)</button>
+      <button id="nav-agents" onclick="showSection('agents')">Agents (create & keys)</button>
+      <button id="nav-flights" onclick="showSection('flights')">Flights (demo API)</button>
+      <button id="nav-stats" onclick="showSection('stats')">Stats & Billing</button>
+    </nav>
+
+    <section id="section-auth">
+      <div class="card">
+        <h3>Auth – Sign up / Log in</h3>
+        <p>
+          These endpoints create and authenticate <strong>agent developers</strong>.
+          Use the token here for all the other calls.
+        </p>
+
+        <div class="field">
+          <label>Email</label>
+          <input id="auth-email" type="email" placeholder="you@example.com" />
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input id="auth-password" type="password" placeholder="Minimum 8 characters" />
+        </div>
+
+        <button class="btn" onclick="callSignup()">Sign up</button>
+        <button class="btn secondary" onclick="callLogin()">Log in</button>
+
+        <div class="status-bar" id="auth-result-status"></div>
+      </div>
+
+      <div class="card">
+        <h3>Current Token</h3>
+        <p>Stored in <code>localStorage</code> and used for authenticated calls.</p>
+        <pre id="token-output">(no token yet)</pre>
+      </div>
+    </section>
+
+    <section id="section-agents" style="display:none">
+      <div class="card">
+        <h3>Create Agent</h3>
+        <p>
+          Calls <code>POST /api/agents</code>. Requires <strong>Authorization: Bearer &lt;token&gt;</strong>.
+        </p>
+        <button class="btn" onclick="createAgent()" id="btn-create-agent">Create new agent</button>
+        <div class="status-bar" id="agents-status"></div>
+      </div>
+
+      <div class="card">
+        <h3>Last Agent Response</h3>
+        <p>Shows the result of the most recent <code>/api/agents</code> call.</p>
+        <pre id="agents-output">(no agents created yet)</pre>
+      </div>
+    </section>
+
+    <section id="section-flights" style="display:none">
+      <div class="card">
+        <h3>Flight Search (human lane)</h3>
+        <p>
+          Calls <code>GET /api/flights/search</code> <span class="tag">no auth</span>.
+          This uses the <strong>human</strong> lane – no HAP signature.
+        </p>
+        <div class="field">
+          <label>Origin</label>
+          <input id="flights-origin" value="SFO" />
+        </div>
+        <div class="field">
+          <label>Destination</label>
+          <input id="flights-destination" value="LAX" />
+        </div>
+        <div class="field">
+          <label>Date (YYYY-MM-DD)</label>
+          <input id="flights-date" value="2025-12-01" />
+        </div>
+        <button class="btn" onclick="searchFlightsHuman()">Search as human</button>
+        <div class="status-bar" id="flights-status"></div>
+      </div>
+
+      <div class="card">
+        <h3>Last Flights Response</h3>
+        <pre id="flights-output">(no flight search yet)</pre>
+      </div>
+    </section>
+
+    <section id="section-stats" style="display:none">
+      <div class="card">
+        <h3>Stats summary</h3>
+        <p>
+          Calls <code>GET /api/stats/summary</code>.
+          Shows daily counts of human / agent / unknown requests and revenue.
+        </p>
+        <button class="btn" onclick="getStats()">Get stats</button>
+        <div class="status-bar" id="stats-status"></div>
+      </div>
+
+      <div class="card">
+        <h3>Billing – agents</h3>
+        <p>
+          Calls <code>GET /api/billing/agents</code> to show wallets, credits, and payment sessions.
+        </p>
+        <button class="btn secondary" onclick="getBillingAgents()">Get billing/agents</button>
+        <div class="status-bar" id="billing-status"></div>
+      </div>
+
+      <div class="card">
+        <h3>Last Stats / Billing Response</h3>
+        <pre id="stats-output">(no stats or billing calls yet)</pre>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const API_BASE = "https://api.sanatdhir.com";
+    let authToken = null;
+    let authEmail = null;
+
+    // ---------- UI helpers ----------
+
+    function showSection(name) {
+      const sections = ["auth", "agents", "flights", "stats"];
+      for (const s of sections) {
+        document.getElementById("section-" + s).style.display = (s === name) ? "block" : "none";
+        document.getElementById("nav-" + s).classList.toggle("active", s === name);
+      }
+    }
+
+    function setAuthStatus() {
+      const label = document.getElementById("auth-status-label");
+      const btnCreateAgent = document.getElementById("btn-create-agent");
+
+      if (authToken && authEmail) {
+        label.textContent = "Logged in as " + authEmail;
+        btnCreateAgent.disabled = false;
+      } else {
+        label.textContent = "Not logged in";
+        btnCreateAgent.disabled = true;
+      }
+    }
+
+    function loadAuthFromStorage() {
+      authToken = localStorage.getItem("hapAuthToken") || null;
+      authEmail = localStorage.getItem("hapAuthEmail") || null;
+      renderToken();
+      setAuthStatus();
+    }
+
+    function saveAuth(token, email) {
+      authToken = token;
+      authEmail = email;
+      localStorage.setItem("hapAuthToken", token);
+      localStorage.setItem("hapAuthEmail", email);
+      renderToken();
+      setAuthStatus();
+    }
+
+    function clearAuth() {
+      authToken = null;
+      authEmail = null;
+      localStorage.removeItem("hapAuthToken");
+      localStorage.removeItem("hapAuthEmail");
+      renderToken();
+      setAuthStatus();
+    }
+
+    function renderToken() {
+      const pre = document.getElementById("token-output");
+      if (!authToken) {
+        pre.textContent = "(no token yet)";
+      } else {
+        pre.textContent = JSON.stringify(
+          { email: authEmail, token: authToken },
+          null,
+          2
+        );
+      }
+    }
+
+    function setStatus(id, msg) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = msg || "";
+    }
+
+    function showJson(id, obj) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (!obj) {
+        el.textContent = "(no data)";
+        return;
+      }
+      el.textContent = JSON.stringify(obj, null, 2);
+    }
+
+    function getAuthHeaders() {
+      const headers = { "Content-Type": "application/json" };
+      if (authToken) {
+        headers["Authorization"] = "Bearer " + authToken;
+      }
+      return headers;
+    }
+
+    // ---------- Auth calls ----------
+
+    async function callSignup() {
+      const email = document.getElementById("auth-email").value.trim();
+      const password = document.getElementById("auth-password").value;
+
+      setStatus("auth-result-status", "Signing up...");
+      try {
+        const resp = await fetch(API_BASE + "/api/auth/signup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await resp.json().catch(() => ({}));
+
+        if (!resp.ok) {
+          setStatus("auth-result-status", "Signup failed: " + (data.message || resp.status));
+        } else {
+          saveAuth(data.token, data.email);
+          setStatus("auth-result-status", "Signup successful. Token stored.");
+        }
+      } catch (err) {
+        setStatus("auth-result-status", "Error: " + err);
+      }
+    }
+
+    async function callLogin() {
+      const email = document.getElementById("auth-email").value.trim();
+      const password = document.getElementById("auth-password").value;
+
+      setStatus("auth-result-status", "Logging in...");
+      try {
+        const resp = await fetch(API_BASE + "/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await resp.json().catch(() => ({}));
+
+        if (!resp.ok) {
+          setStatus("auth-result-status", "Login failed: " + (data.message || resp.status));
+        } else {
+          saveAuth(data.token, data.email);
+          setStatus("auth-result-status", "Login successful. Token stored.");
+        }
+      } catch (err) {
+        setStatus("auth-result-status", "Error: " + err);
+      }
+    }
+
+    // ---------- Agents ----------
+
+    async function createAgent() {
+      if (!authToken) {
+        setStatus("agents-status", "You must log in first.");
+        return;
+      }
+
+      setStatus("agents-status", "Creating agent...");
+      try {
+        const resp = await fetch(API_BASE + "/api/agents", {
+          method: "POST",
+          headers: getAuthHeaders(),
+          body: "", // no body needed for now
+        });
+        const data = await resp.json().catch(() => ({}));
+
+        if (!resp.ok) {
+          setStatus("agents-status", "Create agent failed: " + (data.message || resp.status));
+        } else {
+          setStatus("agents-status", "Agent created.");
+          showJson("agents-output", data);
+        }
+      } catch (err) {
+        setStatus("agents-status", "Error: " + err);
+      }
+    }
+
+    // ---------- Flights ----------
+
+    async function searchFlightsHuman() {
+      const origin = document.getElementById("flights-origin").value.trim();
+      const destination = document.getElementById("flights-destination").value.trim();
+      const date = document.getElementById("flights-date").value.trim();
+
+      setStatus("flights-status", "Calling /api/flights/search as human...");
+      const url =
+        API_BASE +
+        "/api/flights/search?origin=" +
+        encodeURIComponent(origin) +
+        "&destination=" +
+        encodeURIComponent(destination) +
+        "&date=" +
+        encodeURIComponent(date);
+
+      try {
+        const resp = await fetch(url, {
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
+        });
+        const data = await resp.json().catch(() => ({}));
+
+        setStatus(
+          "flights-status",
+          "Status: " + resp.status + " " + resp.statusText
+        );
+        showJson("flights-output", data);
+      } catch (err) {
+        setStatus("flights-status", "Error: " + err);
+      }
+    }
+
+    // ---------- Stats & Billing ----------
+
+    async function getStats() {
+      setStatus("stats-status", "Calling /api/stats/summary...");
+      try {
+        const resp = await fetch(API_BASE + "/api/stats/summary", {
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
+        });
+        const data = await resp.json().catch(() => ({}));
+
+        setStatus("stats-status", "Status: " + resp.status + " " + resp.statusText);
+        showJson("stats-output", data);
+      } catch (err) {
+        setStatus("stats-status", "Error: " + err);
+      }
+    }
+
+    async function getBillingAgents() {
+      setStatus("billing-status", "Calling /api/billing/agents...");
+      try {
+        const resp = await fetch(API_BASE + "/api/billing/agents", {
+          method: "GET",
+          headers: getAuthHeaders(),
+        });
+        const data = await resp.json().catch(() => ({}));
+
+        setStatus(
+          "billing-status",
+          "Status: " + resp.status + " " + resp.statusText
+        );
+        showJson("stats-output", data);
+      } catch (err) {
+        setStatus("billing-status", "Error: " + err);
+      }
+    }
+
+    // ---------- Init ----------
+
+    loadAuthFromStorage();
+  </script>
+</body>
+</html>
