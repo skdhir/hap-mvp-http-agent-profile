@@ -643,6 +643,60 @@ def maybe_autopay_topup(agent_id: str, current_credits: int):
 
 # ---------- Handlers ----------
 
+def handle_agents_autopay_update(event, context, user_email: str):
+    """
+    Update autopayEnabled for a single agent owned by this user.
+    Request JSON: { "agentId": "...", "autopayEnabled": true/false }
+    """
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return build_response(400, {"status": "error", "message": "Invalid JSON body"})
+
+    agent_id = body.get("agentId")
+    autopay_enabled = body.get("autopayEnabled")
+
+    if not agent_id or autopay_enabled is None:
+        return build_response(
+            400,
+            {"status": "error", "message": "agentId and autopayEnabled are required"},
+        )
+
+    # normalize to bool
+    if isinstance(autopay_enabled, str):
+        enabled = autopay_enabled.lower() in ("1", "true", "yes", "y", "on")
+    else:
+        enabled = bool(autopay_enabled)
+
+    try:
+        resp = agents_table.get_item(Key={"agentId": agent_id})
+        item = resp.get("Item")
+        if not item:
+            return build_response(404, {"status": "error", "message": "Agent not found"})
+
+        owner_email = item.get("ownerEmail")
+        if owner_email and owner_email != user_email:
+            return build_response(403, {"status": "error", "message": "Not your agent"})
+
+        agents_table.update_item(
+            Key={"agentId": agent_id},
+            UpdateExpression="SET autopayEnabled = :v",
+            ExpressionAttributeValues={":v": enabled},
+        )
+
+        return build_response(
+            200,
+            {
+                "status": "ok",
+                "agentId": agent_id,
+                "autopayEnabled": enabled,
+            },
+        )
+
+    except Exception as e:
+        logger.exception("failed to update agent autopay")
+        return build_response(500, {"status": "error", "message": "Internal error"})
+
 def handle_agents_list(event):
     """
     GET /api/agents
@@ -655,23 +709,15 @@ def handle_agents_list(event):
     Response:
       { "status": "ok", "agents": [ ... ] }
     """
-    # 1) Extract and verify token
-    headers = event.get("headers") or {}
-    auth = headers.get("Authorization") or headers.get("authorization") or ""
-    auth = auth.strip()
-
-    if not auth.lower().startswith("bearer "):
-        return build_response(
-            401,
-            {"status": "unauthorized", "message": "Login required (missing Bearer token)"},
-        )
-
-    token = auth.split(" ", 1)[1].strip()
-    payload = verify_token(token)
+    # 1) Use the existing helper to verify the token
+    payload = get_current_user(event)
     if not payload:
         return build_response(
             401,
-            {"status": "unauthorized", "message": "Invalid or expired token"},
+            {
+                "status": "unauthorized",
+                "message": "Login required (missing or invalid Bearer token)",
+            },
         )
 
     owner_email = (payload.get("email") or "").strip().lower()
@@ -694,23 +740,27 @@ def handle_agents_list(event):
             {"status": "error", "message": "Error loading agents"},
         )
 
-    # 3) Shape the response
+    # 3) Shape the response, including autopayEnabled
     agents = []
     for item in items:
+        enabled = item.get("autopayEnabled", False)
+        if isinstance(enabled, str):
+            enabled = enabled.lower() in ("1", "true", "yes", "y")
+
         agents.append(
             {
                 "agentId": item.get("agentId"),
                 "keyId": item.get("keyId"),
                 "ownerEmail": item.get("ownerEmail"),
                 "ownerUserId": item.get("ownerUserId"),
-                "status": item.get("status"),
+                "status": item.get("status", "active"),
                 "createdAt": item.get("createdAt"),
-                # You *can* include publicKeyJwk if you want:
-                # "publicKeyJwk": item.get("publicKeyJwk"),
+                "autopayEnabled": bool(enabled),
             }
         )
 
     return build_response(200, {"status": "ok", "agents": agents})
+
 
 def handle_auth_signup(event):
     """
@@ -1297,6 +1347,27 @@ def lambda_handler(event, context):
             return handle_auth_login(event)
         if raw_path == "/api/agents" and method == "GET":
             return handle_agents_list(event)
+        if raw_path == "/api/agents/autopay":
+            # CORS preflight (OPTIONS) – just return OK with CORS headers
+            if method == "OPTIONS":
+                return build_response(200, {"status": "ok"})
+
+            if method == "POST":
+                payload = get_current_user(event)
+                if not payload:
+                    return build_response(
+                        401,
+                        {
+                            "status": "unauthorized",
+                            "message": "Login required (missing or invalid Bearer token)",
+                        },
+                    )
+                user_email = (payload.get("email") or "").strip().lower()
+                return handle_agents_autopay_update(
+                    event,
+                    context,
+                    user_email=user_email,
+                )
 
         # default 404
         return build_response(

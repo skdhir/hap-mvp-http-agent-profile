@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useAuth } from "../AuthContext";
-import { listAgents, createAgent, getBillingAgents } from "../api";
+import { listAgents, createAgent, getBillingAgents, updateAgentAutopay } from "../api";
 import type {
   AgentSummary,
   BillingResponse,
@@ -17,12 +17,21 @@ export const AgentsPage: React.FC = () => {
   const [lastCreatedAgent, setLastCreatedAgent] =
     useState<CreatedAgentResponse | null>(null);
 
+  const [draftAutopay, setDraftAutopay] = useState<Record<string, boolean>>({});
+
   const loadAgents = async () => {
     if (!token) return;
     setStatus("Loading agents...");
     try {
       const result = await listAgents(token);
       setAgents(result);
+
+    const draft: Record<string, boolean> = {};
+    result.forEach((a) => {
+      draft[a.agentId] = !!a.autopayEnabled;
+    });
+    setDraftAutopay(draft);
+
       setStatus(`Loaded ${result.length} agents.`);
     } catch (err: any) {
       setStatus(err.message || String(err));
@@ -402,6 +411,15 @@ export const AgentsPage: React.FC = () => {
                     borderBottom: "1px solid #e5e7eb",
                   }}
                 >
+                  Payment mode
+                </th>
+                <th
+                  style={{
+                    textAlign: "left",
+                    padding: 8,
+                    borderBottom: "1px solid #e5e7eb",
+                  }}
+                >
                   Created
                 </th>
                 <th
@@ -416,45 +434,116 @@ export const AgentsPage: React.FC = () => {
               </tr>
             </thead>
             <tbody>
-              {agents.map((a) => (
-                <tr key={a.agentId}>
-                  <td
-                    style={{
-                      borderBottom: "1px solid #e5e7eb",
-                      padding: 8,
-                      fontFamily: "monospace",
-                      fontSize: 12,
-                    }}
-                  >
-                    {a.agentId}
-                  </td>
-                  <td
-                    style={{
-                      borderBottom: "1px solid #e5e7eb",
-                      padding: 8,
-                      textAlign: "right",
-                    }}
-                  >
-                    {walletsByAgent[a.agentId] ?? 0}
-                  </td>
-                  <td
-                    style={{
-                      borderBottom: "1px solid #e5e7eb",
-                      padding: 8,
-                    }}
-                  >
-                    {a.createdAt || "-"}
-                  </td>
-                  <td
-                    style={{
-                      borderBottom: "1px solid #e5e7eb",
-                      padding: 8,
-                    }}
-                  >
-                    {a.status || "active"}
-                  </td>
-                </tr>
-              ))}
+              {agents.map((a) => {
+                const currentDraft = draftAutopay[a.agentId] ?? !!a.autopayEnabled;
+                const isDirty = currentDraft !== !!a.autopayEnabled;
+
+                return (
+                  <tr key={a.agentId}>
+                    <td
+                      style={{
+                        borderBottom: "1px solid #e5e7eb",
+                        padding: 8,
+                        fontFamily: "monospace",
+                        fontSize: 12,
+                      }}
+                    >
+                      {a.agentId}
+                    </td>
+                    <td
+                      style={{
+                        borderBottom: "1px solid #e5e7eb",
+                        padding: 8,
+                        textAlign: "right",
+                      }}
+                    >
+                      {walletsByAgent[a.agentId] ?? 0}
+                    </td>
+
+                    {/* Payment mode column */}
+                    <td
+                      style={{
+                        borderBottom: "1px solid #e5e7eb",
+                        padding: 8,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <label style={{ fontSize: 12 }}>
+                          <input
+                            type="checkbox"
+                            checked={currentDraft}
+                            onChange={(e) =>
+                              setDraftAutopay((prev) => ({
+                                ...prev,
+                                [a.agentId]: e.target.checked,
+                              }))
+                            }
+                          />{" "}
+                          {currentDraft
+                            ? "Auto (off‑session)"
+                            : "Manual (402 + Checkout)"}
+                        </label>
+                        <button
+                          type="button"
+                          disabled={!isDirty}
+                          onClick={async () => {
+                            if (!token) return;
+                            const newValue = currentDraft;
+                            setStatus(`Saving autopay for ${a.agentId}...`);
+                            try {
+                              await updateAgentAutopay(token, a.agentId, newValue);
+
+                              // Update main agents array so isDirty resets
+                              setAgents((prev) =>
+                                prev.map((agent) =>
+                                  agent.agentId === a.agentId
+                                    ? { ...agent, autopayEnabled: newValue }
+                                    : agent
+                                )
+                              );
+                              setStatus(
+                                `Autopay updated for ${a.agentId} – now ${
+                                  newValue ? "Auto" : "Manual"
+                                }.`
+                              );
+                            } catch (err: any) {
+                              setStatus(err.message || String(err));
+                            }
+                          }}
+                          style={{
+                            padding: "4px 8px",
+                            fontSize: 12,
+                            borderRadius: 4,
+                            border: "1px solid #d1d5db",
+                            backgroundColor: isDirty ? "#ffffff" : "#f3f4f6",
+                            color: "#111827",
+                            cursor: isDirty ? "pointer" : "default",
+                          }}
+                        >
+                          Save
+                        </button>
+                      </div>
+                    </td>
+
+                    <td
+                      style={{
+                        borderBottom: "1px solid #e5e7eb",
+                        padding: 8,
+                      }}
+                    >
+                      {a.createdAt || "-"}
+                    </td>
+                    <td
+                      style={{
+                        borderBottom: "1px solid #e5e7eb",
+                        padding: 8,
+                      }}
+                    >
+                      {a.status || "active"}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

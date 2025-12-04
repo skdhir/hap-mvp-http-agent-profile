@@ -6,6 +6,7 @@ export type AgentSummary = {
   keyId?: string;
   ownerEmail?: string;
   ownerUserId?: string;
+  autopayEnabled?: boolean;
   status?: string;
   createdAt?: string;
 };
@@ -30,21 +31,47 @@ export interface CreatedAgentResponse {
   createdAt: string;
 }
 
-export async function listAgents(token: string): Promise<AgentSummary[]> {
-  const resp = await fetch(`${API_BASE}/api/agents`, {
-    method: "GET",
+export async function updateAgentAutopay(
+  token: string,
+  agentId: string,
+  autopayEnabled: boolean
+): Promise<{ status: string; agentId: string; autopayEnabled: boolean }> {
+  const resp = await fetch(`${API_BASE}/api/agents/autopay`, {
+    method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
+    body: JSON.stringify({ agentId, autopayEnabled }),
   });
 
-  const data = await resp.json();
   if (!resp.ok) {
-    throw new Error(data.message || `Failed to list agents (${resp.status})`);
+    const text = await resp.text();
+    throw new Error(
+      `Failed to update autopay: ${resp.status} ${resp.statusText} – ${text}`
+    );
   }
 
-  return data.agents || [];
+  return (await resp.json()) as {
+    status: string;
+    agentId: string;
+    autopayEnabled: boolean;
+  };
+}
+
+export async function listAgents(token: string): Promise<AgentSummary[]> {
+  const resp = await fetch(`${API_BASE}/api/agents`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!resp.ok) {
+    throw new Error(`Failed to list agents: ${resp.status} ${resp.statusText}`);
+  }
+
+  const json = await resp.json();
+  return (json.agents || []) as AgentSummary[];
 }
 
 export async function createAgent(
